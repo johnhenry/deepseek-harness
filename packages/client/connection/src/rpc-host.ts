@@ -12,7 +12,7 @@ import {
   type ServerResponse as RpcServerResponse,
 } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { bridge, type FetchHandler } from './http-bridge.ts'
-import { isTrustedApiRequest } from './api-request-trust.ts'
+import { describeApiRequestTrust } from './api-request-trust.ts'
 import { API_PATH } from './api-path.ts'
 import type {
   ConnectionRpcEndpointMatcher,
@@ -79,8 +79,14 @@ export class HostConnectionService extends Service implements HostConnectionHand
         if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
           return fallback.fetch(request)
         }
-        if (interceptor.options.authority === 'loopback' && !isTrustedApiRequest(request, [])) {
-          return Promise.resolve(new Response('forbidden', { status: 403 }))
+        if (interceptor.options.authority === 'loopback') {
+          const verdict = describeApiRequestTrust(request, [])
+          if (!verdict.trusted) {
+            return Promise.resolve(new Response(`forbidden: ${verdict.reason}`, {
+              status: 403,
+              headers: { 'content-type': 'text/plain; charset=utf-8' },
+            }))
+          }
         }
         return interceptor.fetchHandler.fetch(request)
       },
@@ -100,9 +106,10 @@ export class HostConnectionService extends Service implements HostConnectionHand
       kind: 'prefix',
       path: channel,
       handler: async (req, res) => {
-        if (!isTrustedApiRequest(req, trustedHosts)) {
-          res.writeHead(403)
-          res.end('forbidden')
+        const verdict = describeApiRequestTrust(req, trustedHosts)
+        if (!verdict.trusted) {
+          res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end(`forbidden: ${verdict.reason}`)
           return
         }
         await bridge(req, res, fetchHandler)

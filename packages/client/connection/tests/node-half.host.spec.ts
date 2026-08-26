@@ -163,7 +163,11 @@ describe('connection node half', () => {
       host: 'harness.example', origin: 'http://harness.example', 'sec-fetch-site': 'same-origin',
     }), response)
     expect(state.status).toBe(403)
-    expect(state.body).toBe('forbidden')
+    // The body names the refusing check so a 403 is self-diagnosable.
+    expect(state.body).toBe(
+      'forbidden: Host "harness.example" is neither loopback nor a declared authority'
+      + ' — serve this deployment over loopback, or name the authority with --trusted-host',
+    )
     await dispose()
   })
 
@@ -190,7 +194,12 @@ describe('connection node half', () => {
         denied.response,
       )
       expect(denied.state.status).toBe(403)
-      expect(denied.state.body).toBe('forbidden')
+      // The privileged refusal names the pin, not the trust list: a reader who
+      // just added --trusted-host must not read this as a missing entry.
+      expect(denied.state.body).toBe(
+        `forbidden: ${method} is privileged and pinned to loopback, which --trusted-host does not widen`
+        + ' — reach this deployment over localhost, forwarding the port if it runs elsewhere',
+      )
     }
     const read = fakeResponse()
     await routes[0]!.handler(fakeRequest({ host: 'harness.example' }), read.response)
@@ -317,7 +326,8 @@ describe('connection node half', () => {
 
     const denied = fakeResponse()
     await route.handler(fakePost({ host: 'other.example' }, '/api/goals/create', request), denied.response)
-    expect(denied.state).toMatchObject({ status: 403, body: 'forbidden' })
+    expect(denied.state.status).toBe(403)
+    expect(String(denied.state.body)).toContain('is neither loopback nor a declared authority')
     expect(calls).toHaveLength(1)
 
     const unclaimed = fakeResponse()
@@ -339,6 +349,10 @@ describe('connection node half', () => {
     const loopbackOnly = fakeResponse()
     await route.handler(fakePost({ host: 'harness.example' }, '/api/goals/create', request), loopbackOnly.response)
     expect(loopbackOnly.state.status).toBe(403)
+    // The same interceptor serves the loopback caller it is pinned to.
+    const overLoopback = fakeResponse()
+    await route.handler(fakePost({ host: '127.0.0.1:3080' }, '/api/goals/create', request), overLoopback.response)
+    expect(overLoopback.state.status).not.toBe(403)
     await removeLoopback()
     await fiber.dispose()
   })
@@ -360,7 +374,8 @@ describe('connection node half', () => {
 
     const denied = fakeResponse()
     await route.handler(fakePost({ host: 'other.example' }, '/rpc/goals/create', {}), denied.response)
-    expect(denied.state).toMatchObject({ status: 403, body: 'forbidden' })
+    expect(denied.state.status).toBe(403)
+    expect(String(denied.state.body)).toContain('is neither loopback nor a declared authority')
 
     const methodMismatch = fakeResponse()
     await route.handler(fakePost({ host: 'harness.example' }, '/rpc/goals/create', {
