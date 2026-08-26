@@ -7,7 +7,8 @@ import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { API_PATH, HOST_EVENTS_PATH, MUX_EVENTS_PATH } from './api-path.ts'
 import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
-import { assertTrustedAuthority, isTrustedApiRequest } from './api-request-trust.ts'
+import type { ApiTrustVerdict } from './api-request-trust.ts'
+import { assertTrustedAuthority, describeApiRequestTrust } from './api-request-trust.ts'
 import { HostConnectionService } from './rpc-host.ts'
 import { rejectWebSocketUpgrade, WebSocketDownlinks } from './websocket-downlink.ts'
 
@@ -119,6 +120,22 @@ const PRIVILEGED_METHODS = new Set([
 ])
 
 /**
+ * 403 body for a privileged method. These pass the fence with an empty trust
+ * list, so a deployment reached over a declared `trustedHosts` authority
+ * serves the rest of /api and refuses exactly this set — the shape that reads
+ * as "everything works except the folder picker". Name the loopback pin when
+ * that is what refused, so the caller stops hunting for a `--trusted-host`
+ * entry that cannot lift it.
+ * @param method - the privileged RPC method that was refused.
+ * @param verdict - the refusing verdict from the empty-trust-list fence pass.
+ */
+function privilegedRefusal(method: string, verdict: ApiTrustVerdict & { trusted: false }): string {
+  if (verdict.refusal !== 'untrusted-host') return `forbidden: ${verdict.reason}`
+  return `forbidden: ${method} is privileged and pinned to loopback, which --trusted-host does not widen`
+    + ' — reach this deployment over localhost, forwarding the port if it runs elsewhere'
+}
+
+/**
  * Mounts the API gateway under the browser transport prefix. Every request on
  * the prefix passes the browser-trust fence first (DNS-rebinding and
  * cross-site defense — [api-request-trust](./api-request-trust.ts));
@@ -142,10 +159,14 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
       const method = pathname.startsWith(`${API_PATH}/`)
         ? pathname.slice(API_PATH.length + 1)
         : undefined
-      if (method !== undefined
-        && PRIVILEGED_METHODS.has(method)
-        && !isTrustedApiRequest(request, [])) {
-        return new Response('forbidden', { status: 403 })
+      if (method !== undefined && PRIVILEGED_METHODS.has(method)) {
+        const verdict = describeApiRequestTrust(request, [])
+        if (!verdict.trusted) {
+          return new Response(privilegedRefusal(method, verdict), {
+            status: 403,
+            headers: { 'content-type': 'text/plain; charset=utf-8' },
+          })
+        }
       }
       if (request.method === 'GET' && (pathname === MUX_EVENTS_PATH || pathname === HOST_EVENTS_PATH)) {
         return new Response('upgrade required', {
@@ -162,9 +183,10 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
     kind: 'prefix',
     path: API_PATH,
     handler: async (req, res) => {
-      if (!isTrustedApiRequest(req, trustedHosts)) {
-        res.writeHead(403)
-        res.end('forbidden')
+      const verdict = describeApiRequestTrust(req, trustedHosts)
+      if (!verdict.trusted) {
+        res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end(`forbidden: ${verdict.reason}`)
         return
       }
       await bridge(req, res, fetchHandler, maxRequestBodyBytes)
@@ -181,8 +203,9 @@ export function apply(ctx: Context, config?: ConnectionConfig): void {
       apiCtx.effect(() => apiCtx.webServer.registerUpgrade({
         path,
         handler: (req, socket, head) => {
-          if (!isTrustedApiRequest(req, trustedHosts)) {
-            rejectWebSocketUpgrade(socket)
+          const verdict = describeApiRequestTrust(req, trustedHosts)
+          if (!verdict.trusted) {
+            rejectWebSocketUpgrade(socket, verdict.reason)
             return
           }
           return handle(req, socket, head)

@@ -140,14 +140,19 @@ export class WebSocketDownlinks {
 /**
  * Reject an untrusted upgrade before protocol negotiation.
  * @param socket - Raw HTTP socket that remains owned by the caller.
+ * @param reason - trust-fence diagnosis to carry in the body.
  */
-export function rejectWebSocketUpgrade(socket: Duplex): void {
+export function rejectWebSocketUpgrade(socket: Duplex, reason: string): void {
+  // A failed upgrade surfaces in the browser as an opaque close, so this body
+  // reaches whoever reads the socket rather than the page. It still matches
+  // the /api route's 403, keeping one diagnosis for both transports.
+  const body = `forbidden: ${reason}`
   socket.end([
     'HTTP/1.1 403 Forbidden',
     'Connection: close',
     'Content-Type: text/plain; charset=utf-8',
-    'Content-Length: 9',
+    `Content-Length: ${String(Buffer.byteLength(body))}`,
     '',
-    'forbidden',
+    body,
   ].join('\r\n'))
 }

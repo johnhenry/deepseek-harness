@@ -88,12 +88,60 @@ function isTrustedAuthority(hostUrl: URL, trustedHosts: readonly string[]): bool
 }
 
 /**
- * Decide whether one /api request may reach the RPC bridge.
+ * Why the fence refused, in terms of the headers the caller itself sent.
+ * A 403 body carrying this is not a disclosure: every value quoted came from
+ * the request, and no configured `trustedHosts` entry is ever named.
+ */
+export type ApiTrustRefusal =
+  /** No Host header at all — the fence has nothing to bind the request to. */
+  | 'no-host'
+  /** Host present but not a parsable authority. */
+  | 'bad-host'
+  /** Host parsed, but is neither loopback nor a declared `trustedHosts` authority. */
+  | 'untrusted-host'
+  /** The browser labelled the request cross-site. */
+  | 'cross-site'
+  /** Origin present but not an http(s) authority (opaque `null`, `file:`, a custom scheme). */
+  | 'bad-origin'
+  /** Origin is a real authority, but not this one. */
+  | 'origin-mismatch'
+
+/** Fence verdict: `trusted`, or the refusal with a single-line diagnosis. */
+export type ApiTrustVerdict =
+  | { trusted: true }
+  | { trusted: false; refusal: ApiTrustRefusal; reason: string }
+
+function refuse(refusal: ApiTrustRefusal, reason: string): ApiTrustVerdict {
+  return { trusted: false, refusal, reason }
+}
+
+/**
+ * Parse an Origin header into the authority it names. Only the two special
+ * HTTP schemes count: a page this server served is always http(s), so any
+ * other scheme is some other kind of context (`file:`, a packaged-app or
+ * extension scheme) claiming our authority, and the WHATWG parser leaves
+ * non-special schemes unnormalized besides.
+ * @param origin - the Origin header, verbatim (`null` for an opaque origin).
+ */
+function parseOrigin(origin: string): URL | undefined {
+  try {
+    const url = new URL(origin)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Decide whether one /api request may reach the RPC bridge, and say why not.
  * @param request - Node HTTP or Fetch request facts (headers).
  * @param trustedHosts - non-loopback authorities this deployment serves: exact `host:port`, or port-less `host` matching any port.
- * @returns true when the Host is ours (loopback or trusted) and any attached browser markers are same-origin.
+ * @returns the verdict; refusals carry a diagnosis built only from request headers.
  */
-export function isTrustedApiRequest(request: ApiTrustRequest, trustedHosts: readonly string[]): boolean {
+export function describeApiRequestTrust(
+  request: ApiTrustRequest,
+  trustedHosts: readonly string[],
+): ApiTrustVerdict {
   // Host fence (DNS-rebinding defense), applied to every request: the browser
   // fills Host from the URL it believes it is talking to, so a rebound page
   // carries the attacker's domain here even though the socket lands on this
@@ -102,22 +150,47 @@ export function isTrustedApiRequest(request: ApiTrustRequest, trustedHosts: read
   // Fetch-Metadata, indistinguishable from curl, and its response is readable
   // by the rebound page.
   const host = header(request.headers, 'host')
-  if (host === undefined) return false
+  if (host === undefined) return refuse('no-host', 'request carried no Host header')
   const hostUrl = parseAuthority(host)
-  if (hostUrl === undefined) return false
-  if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false
+  if (hostUrl === undefined) return refuse('bad-host', `Host ${JSON.stringify(host)} is not a parsable authority`)
+  if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) {
+    return refuse(
+      'untrusted-host',
+      `Host ${JSON.stringify(host)} is neither loopback nor a declared authority`
+      + ' — serve this deployment over loopback, or name the authority with --trusted-host',
+    )
+  }
   // Cross-site fence: modern browsers label the initiator relationship on
   // every fetch; an explicit cross-site marker is refused regardless of Origin.
-  if (header(request.headers, 'sec-fetch-site') === 'cross-site') return false
-  // Origin fence: when a browser attaches an Origin it must be exactly this
-  // authority (compared through the same normalization as the Host). Absent
-  // Origin is fine — the Host fence above already bound the request. The
-  // literal "null" (sandboxed iframes, file: pages) is an opaque origin, refused.
-  const origin = header(request.headers, 'origin')
-  if (origin === undefined) return true
-  try {
-    return new URL(origin).host === hostUrl.host
-  } catch {
-    return false
+  if (header(request.headers, 'sec-fetch-site') === 'cross-site') {
+    return refuse('cross-site', 'request is labelled sec-fetch-site: cross-site')
   }
+  // Origin fence: when a browser attaches an Origin it must name exactly this
+  // authority. Absent Origin is fine — the Host fence above already bound the
+  // request.
+  const origin = header(request.headers, 'origin')
+  if (origin === undefined) return { trusted: true }
+  const originUrl = parseOrigin(origin)
+  if (originUrl === undefined) {
+    return refuse('bad-origin', `Origin ${JSON.stringify(origin)} is not an http(s) authority`)
+  }
+  // Normalize both sides under the Origin's scheme. A Host header names an
+  // authority with no scheme of its own, so which port is the default one is
+  // knowable only from the Origin beside it: read under a fixed `http:`, an
+  // explicit `:443` survives on the Host while the browser's https Origin
+  // drops it, and a genuinely same-origin request from behind a TLS
+  // terminator that writes the default port out in full is refused. Ports
+  // still decide trust — only the default port, under the scheme that makes
+  // it default, normalizes away.
+  // An authority that parsed under http cannot fail under https.
+  const scopedHostUrl = originUrl.protocol === 'http:' ? hostUrl : new URL(`https://${host}`)
+  if (originUrl.host !== scopedHostUrl.host) {
+    return refuse(
+      'origin-mismatch',
+      `Origin ${JSON.stringify(origin)} does not name Host ${JSON.stringify(host)}`
+      + ` (compared as ${originUrl.host} against ${scopedHostUrl.host})`
+      + ' — a browser extension or proxy rewriting Origin is the usual cause',
+    )
+  }
+  return { trusted: true }
 }
